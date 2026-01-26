@@ -62,7 +62,8 @@ def _main_func(
     gin_file: str,
     mode: str,
 ) -> None:
-    device = torch.device(f"cuda:{rank}")
+    # Use CPU device for training (change to f"cuda:{rank}" for GPU, f"xpu:{rank}" for XPU)
+    device = torch.device("cpu")
     logger.info(f"rank: {rank}, world_size: {world_size}, device: {device}")
     setup(
         rank=rank,

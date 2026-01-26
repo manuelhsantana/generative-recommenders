@@ -28,7 +28,12 @@ from generative_recommenders.ops.triton.triton_hstu_attention import (
     triton_cached_hstu_mha,
     triton_hstu_mha,
 )
-from hammer.v2.ops.triton.template.tlx_bw_hstu_attention import tlx_bw_hstu_mha_wrapper
+
+# TLX (Triton Language Extensions) for Blackwell GPUs - optional dependency
+try:
+    from hammer.v2.ops.triton.template.tlx_bw_hstu_attention import tlx_bw_hstu_mha_wrapper
+except ImportError:
+    tlx_bw_hstu_mha_wrapper = None  # type: ignore
 
 try:
     from hammer.ops.triton.cc.hstu_attention.triton_cc_hstu_attention import (
@@ -101,6 +106,8 @@ def hstu_mha(
             enable_tma=enable_tma,
         )
     elif kernel == HammerKernel.TLX:
+        if tlx_bw_hstu_mha_wrapper is None:
+            raise RuntimeError("TLX kernel requires hammer package which is not installed. Use HammerKernel.PYTORCH for CPU.")
         return tlx_bw_hstu_mha_wrapper(
             max_seq_len=max_seq_len,
             alpha=alpha,

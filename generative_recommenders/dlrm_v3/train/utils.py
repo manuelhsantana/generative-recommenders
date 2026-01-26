@@ -33,6 +33,7 @@ from typing import (
 import gin
 import torch
 import torchrec
+from generative_recommenders.common import HammerKernel
 from generative_recommenders.dlrm_v3.checkpoint import save_dmp_checkpoint
 from generative_recommenders.dlrm_v3.configs import (
     get_embedding_table_config,
@@ -75,20 +76,22 @@ def setup(
     os.environ["MASTER_ADDR"] = "localhost"
     os.environ["MASTER_PORT"] = str(master_port)
 
-    BACKEND = dist.Backend.NCCL
+    # Use GLOO backend for CPU training (change to NCCL for GPU, XCCL for XPU)
+    BACKEND = dist.Backend.GLOO
     TIMEOUT = 1800
 
     # initialize the process group
     if not dist.is_initialized():
-        dist.init_process_group("nccl", rank=rank, world_size=world_size)
+        dist.init_process_group("gloo", rank=rank, world_size=world_size)
 
     pg = dist.new_group(
         backend=BACKEND,
         timeout=timedelta(seconds=TIMEOUT),
     )
 
-    # set device
-    torch.cuda.set_device(device)
+    # set device - only needed for CUDA
+    if device.type == "cuda":
+        torch.cuda.set_device(device)
 
     return pg
 
@@ -174,6 +177,8 @@ def make_model(
         embedding_tables=table_config,
         is_inference=False,
     )
+    # Use PYTORCH kernel for CPU training (avoids Triton which requires GPU)
+    model.recursive_setattr("_hammer_kernel", HammerKernel.PYTORCH)
 
     return (
         model,
@@ -251,10 +256,99 @@ def sparse_optimizer_factory_and_class(
     return optimizer_cls, kwargs, optimizer_factory
 
 
+def create_static_sharding_plan(
+    model: torch.nn.Module,
+    world_size: int,
+    device: torch.device,
+) -> "ShardingPlan":
+    """
+    Create a static (pre-established) sharding plan to avoid the expensive
+    planner enumeration of all possible permutations.
+    
+    This assigns all embedding tables to table-wise (TW) sharding on rank 0,
+    which is optimal for single-node CPU training.
+    """
+    from torchrec.distributed.planner.types import ShardingPlan
+    from torchrec.distributed.types import ShardingType, ParameterSharding, ShardMetadata
+    from torchrec.distributed.embedding_types import EmbeddingComputeKernel
+    from torchrec.distributed.planner.types import Storage
+    
+    logger.info("Creating static sharding plan (skipping planner enumeration)...")
+    
+    plan_dict: Dict[str, Dict[str, ParameterSharding]] = {}
+    
+    # Find all EmbeddingCollection modules and create sharding plan for each table
+    for module_path, module in model.named_modules():
+        if isinstance(module, EmbeddingCollection):
+            module_plan: Dict[str, ParameterSharding] = {}
+            for table_config in module.embedding_configs():
+                table_name = table_config.name
+                num_embeddings = table_config.num_embeddings
+                embedding_dim = table_config.embedding_dim
+                
+                # Create shard metadata for table-wise sharding (entire table on rank 0)
+                shard_sizes = [num_embeddings, embedding_dim]
+                shard_offsets = [0, 0]
+                placement = f"rank:0/{device.type}"
+                
+                shard_metadata = ShardMetadata(
+                    shard_sizes=shard_sizes,
+                    shard_offsets=shard_offsets,
+                    placement=placement,
+                )
+                
+                # Use table-wise sharding on rank 0 (optimal for single node)
+                module_plan[table_name] = ParameterSharding(
+                    sharding_type=ShardingType.TABLE_WISE.value,
+                    compute_kernel=EmbeddingComputeKernel.FUSED.value,
+                    ranks=[0],
+                    sharding_spec=torchrec.distributed.types.EnumerableShardingSpec(
+                        shards=[shard_metadata]
+                    ),
+                )
+                logger.info(f"  Static plan: {module_path}.{table_name} ({num_embeddings}x{embedding_dim}) -> TW on rank 0")
+            if module_plan:
+                plan_dict[module_path] = module_plan
+        elif isinstance(module, EmbeddingBagCollection):
+            module_plan: Dict[str, ParameterSharding] = {}
+            for table_config in module.embedding_bag_configs():
+                table_name = table_config.name
+                num_embeddings = table_config.num_embeddings
+                embedding_dim = table_config.embedding_dim
+                
+                shard_sizes = [num_embeddings, embedding_dim]
+                shard_offsets = [0, 0]
+                placement = f"rank:0/{device.type}"
+                
+                shard_metadata = ShardMetadata(
+                    shard_sizes=shard_sizes,
+                    shard_offsets=shard_offsets,
+                    placement=placement,
+                )
+                
+                module_plan[table_name] = ParameterSharding(
+                    sharding_type=ShardingType.TABLE_WISE.value,
+                    compute_kernel=EmbeddingComputeKernel.FUSED.value,
+                    ranks=[0],
+                    sharding_spec=torchrec.distributed.types.EnumerableShardingSpec(
+                        shards=[shard_metadata]
+                    ),
+                )
+                logger.info(f"  Static plan: {module_path}.{table_name} ({num_embeddings}x{embedding_dim}) -> TW on rank 0")
+            if module_plan:
+                plan_dict[module_path] = module_plan
+    
+    sharding_plan = ShardingPlan(plan=plan_dict)
+    logger.info(f"Static sharding plan created with {sum(len(v) for v in plan_dict.values())} tables")
+    return sharding_plan
+
+
+@gin.configurable()
 def make_optimizer_and_shard(
     model: torch.nn.Module,
     device: torch.device,
     world_size: int,
+    use_static_plan: bool = True,  # Set to True to skip expensive planner
 ) -> Tuple[DistributedModelParallel, torch.optim.Optimizer]:
     dense_opt_cls, dense_opt_args, dense_opt_factory = (
         dense_optimizer_factory_and_class()
@@ -272,20 +366,30 @@ def make_optimizer_and_shard(
                         sparse_opt_cls, [param], sparse_opt_args
                     )
     sharders = get_default_sharders()
-    planner = EmbeddingShardingPlanner(
-        topology=Topology(
-            local_world_size=world_size,
-            world_size=world_size,
-            compute_device="cuda",
-            hbm_cap=160 * 1024 * 1024 * 1024,
-            ddr_cap=32 * 1024 * 1024 * 1024,
-        )
-    )
+    # Use cpu compute_device for CPU training (change to "cuda" for GPU, "xpu" for XPU)
+    compute_device = device.type if device.type in ("cuda", "xpu") else "cpu"
+    
     pg = dist.GroupMember.WORLD
     env = ShardingEnv.from_process_group(pg)  # pyre-ignore [6]
     pg = env.process_group
 
-    plan = planner.collective_plan(model, sharders, pg)
+    if use_static_plan and world_size == 1:
+        # Use static plan for single-node training (avoids expensive planner)
+        logger.info("Using static sharding plan (use_static_plan=True, world_size=1)")
+        plan = create_static_sharding_plan(model, world_size, device)
+    else:
+        # Use dynamic planner for multi-node or when explicitly requested
+        logger.info("Using dynamic EmbeddingShardingPlanner...")
+        planner = EmbeddingShardingPlanner(
+            topology=Topology(
+                local_world_size=world_size,
+                world_size=world_size,
+                compute_device=compute_device,
+                hbm_cap=160 * 1024 * 1024 * 1024 if compute_device != "cpu" else 0,
+                ddr_cap=128 * 1024 * 1024 * 1024,  # Increased for CPU training with large embeddings
+            )
+        )
+        plan = planner.collective_plan(model, sharders, pg)
 
     # Shard model
     model = DistributedModelParallel(
